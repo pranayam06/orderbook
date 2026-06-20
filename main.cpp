@@ -6,7 +6,7 @@
 #include <map> 
 #include <unordered_map> 
 #include <algorithm>
-#include <functional>
+#include <numeric>
 
 
 enum class OrderType 
@@ -320,7 +320,7 @@ public:
         return AddOrder(order.ToOrderPointer(existingOrder->GetOrderType()));       
     }
 
-    std::size_t Size() const { return orders_.siz(); }
+    std::size_t Size() const { return orders_.size(); }
 
     OrderbookLevelInfos GetOrderInfos() const 
     { 
@@ -329,11 +329,11 @@ public:
         askInfos.reserve(orders_.size()); 
 
 
-        auto& CreateLevelInfos = [](Price price, const OrderPointers&) { 
+        auto CreateLevelInfos = [](Price price, const OrderPointers& orders) { 
             return LevelInfo{ price, std::accumulate(orders.begin(), orders.end(), (Quantity) 0, 
-            [] (Quantity runningSum, const OrderPointer& order
-            { return runningSum + order->GetRemainingQuantity(); }))}
-        }; 
+            [] (Quantity runningSum, const OrderPointer& order)
+            { return runningSum + order->GetRemainingQuantity(); })};
+        };
 
         for (const auto& [price, orders] : bids_) { 
             bidInfos.push_back(CreateLevelInfos(price, orders)); 
