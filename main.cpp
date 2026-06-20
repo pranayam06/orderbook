@@ -7,6 +7,7 @@
 #include <unordered_map> 
 #include <algorithm>
 #include <numeric>
+#include <iostream>
 
 
 enum class OrderType 
@@ -290,8 +291,6 @@ public:
         
         
         const auto& [order, orderIterator] = orders_[orderId]; 
-        orders_.erase(orderId);
-
         if (order->GetSide() == Side::Buy) 
         {
             auto price = order->GetPrice();
@@ -308,6 +307,8 @@ public:
             if (orders.empty())
                 asks_.erase(price);
         }
+        orders_.erase(orderId);
+
     }
 
     Trades ModifyOrder(OrderModify order) 
@@ -351,5 +352,12 @@ public:
 
 
 int main() {
+    Orderbook orderbook; 
+    const OrderId orderId = 1; 
+    orderbook.AddOrder(std::make_shared<Order>(OrderType::GoodTillCancel, orderId, Side::Buy, 100, 10));    
+    std::cout << orderbook.Size() << std::endl;
+    orderbook.CancelOrder(orderId);
+    std::cout << orderbook.Size() << std::endl;
+    
     return 0; 
 }
