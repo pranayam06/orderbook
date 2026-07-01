@@ -9,11 +9,20 @@
 #include <numeric>
 #include <iostream>
 
+#include <Usings.h>
+#include <Constants.h>
+#include <thread>
+#include <chrono> 
+#include <ctime> 
+#include <numeric>
 
 enum class OrderType 
 { 
     GoodTillCancel, 
-    FillAndKill
+    FillAndKill, 
+    FillOrKill, 
+    GoodForDay, 
+    Market
 };
 
 enum class Side 
@@ -69,6 +78,10 @@ public:
     , remainingQuantity_{ quantity }
     { }
 
+    // overloaded constructor for market ordertype 
+    Order(OrderId orderId, Side side, Quantity quantity): 
+        Order(OrderType::Market, orderId, side, Constants::InvalidPrice, quantity) {}
+
     OrderId GetOrderId() const { return orderId_; }
     Side GetSide() const { return side_; }
     Price GetPrice() const { return price_; }
@@ -84,6 +97,16 @@ public:
         
         remainingQuantity_ -= quantity;
     };
+
+    void ToGoodTillCancel(Price price) 
+    { 
+        if (GetOrderType() != OrderType::Market) {
+            throw std::logic_error(std::format("Order ({}) cannot have its price adjusted, only market orders can.", GetOrderId()));
+        }
+        price_ = price; 
+        orderType_ = OrderType::GoodTillCancel; 
+
+    }
 
 
 private: 
@@ -165,7 +188,85 @@ private:
     std::map<Price, OrderPointers, std::greater<Price>> bids_; 
     // highest bid on top 
     std::map<Price, OrderPointers, std::less<Price>> asks_;
-    std::unordered_map<OrderId, OrderEntry> orders_;
+    std::unordered_map<OrderId, OrderEntry> orders_; 
+    mutable std::mutex ordersMutex_; 
+    std::thread ordersPruneThread_; 
+    std::condition_variable shutdownConditionVariable_; 
+    std::atomic<bool> shutdown_{ false };
+
+    void CancelOrderInternal(OrderId orderId) 
+    { 
+        if (!orders_.contains(orderId)) 
+            return;
+        
+        
+        const auto& [order, orderIterator] = orders_[orderId]; 
+        if (order->GetSide() == Side::Buy) 
+        {
+            auto price = order->GetPrice();
+            auto& orders = bids_.at(price);
+            orders.erase(orderIterator);
+            if (orders.empty())
+                bids_.erase(price);
+        }
+        else 
+        {
+            auto price = order->GetPrice();
+            auto& orders = asks_.at(price);
+            orders.erase(orderIterator);
+            if (orders.empty())
+                asks_.erase(price);
+        }
+        orders_.erase(orderId);
+
+    }
+
+    void PruneGoodForDayOrders()
+    { 
+        using namespace std::chrono; 
+        const auto end = hours(16); 
+
+        while (true) 
+        {
+            const auto now   = system_clock::now();
+            const auto today = floor<days>(now);
+            
+            auto close = sys_days(today) + hours(16);
+            
+            if (close <= now)
+                close += days(1);                                 
+            
+            auto till = close - now + milliseconds(100);
+
+            {
+                std::unique_lock ordersLock { ordersMutex_ }; 
+
+                if (shutdown_.load(std::memory_order::acquire) || 
+                shutdownConditionVariable_.wait_for(ordersLock, till) == std::cv_status::no_timeout) 
+                return;
+
+            } 
+
+            OrderIds orderIds; 
+
+            { 
+                std::scoped_lock ordersLock { ordersMutex_ }; 
+
+                for (const auto& [_, entry] : orders_) 
+                { 
+                    const auto& [order, _] = entry; 
+
+                    if (order->GetOrderType() != OrderType::GoodForDay)
+                        continue; 
+                    
+                    orderIds.push_back(order->GetOrderId()); 
+                }
+
+                CancelOrders(orderIds);
+            }
+
+        }
+    }
 
     bool CanMatch(Side side, Price price) const 
     {
@@ -257,10 +358,31 @@ private:
 
 public: 
 
+    Orderbook() : ordersPruneThread_ { [this] { PruneGoodForDayOrders(); }} {}
+
     Trades AddOrder(OrderPointer order) 
     {
         if (orders_.contains(order->GetOrderId())) 
             return { }; 
+
+        if (order->GetOrderType() == OrderType::Market) 
+        {
+            if (order->GetSide() == Side::Buy and !asks_.empty())
+            {
+                const auto& [worstAsk, __] = *asks_.rbegin();
+                order->ToGoodTillCancel(worstAsk);
+
+            }
+            else if (order->GetSide() == Side::Sell and !bids_.empty())
+            {
+                const auto& [worstBid, __] = *bids_.rbegin();
+                order->ToGoodTillCancel(worstBid);
+
+            }
+            else {
+                return {};
+            }
+        }
 
         if (order->GetOrderType() == OrderType::FillAndKill && !CanMatch(order->GetSide(), order->GetPrice())) 
             return { };
@@ -284,30 +406,23 @@ public:
         return MatchOrders();
     }
 
+    void CancelOrders(OrderIds orderIds) 
+    { 
+        std::scoped_lock ordersLock{ ordersMutex_ }; 
+
+        for (const auto& orderId : orderIds) {
+            CancelOrderInternal(orderId); 
+        }
+
+    }
+
+
     void CancelOrder(OrderId orderId) 
     { 
-        if (!orders_.contains(orderId)) 
-            return;
-        
-        
-        const auto& [order, orderIterator] = orders_[orderId]; 
-        if (order->GetSide() == Side::Buy) 
-        {
-            auto price = order->GetPrice();
-            auto& orders = bids_.at(price);
-            orders.erase(orderIterator);
-            if (orders.empty())
-                bids_.erase(price);
-        }
-        else 
-        {
-            auto price = order->GetPrice();
-            auto& orders = asks_.at(price);
-            orders.erase(orderIterator);
-            if (orders.empty())
-                asks_.erase(price);
-        }
-        orders_.erase(orderId);
+       std::scoped_lock ordersLock{ ordersMutex_ }; 
+
+       // lock once for cancelling one or many orders 
+       CancelOrderInternal(orderId); 
 
     }
 
